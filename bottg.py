@@ -10,7 +10,7 @@ import telebot
 from telebot import types
 
 # Токен берется из переменных окружения Render или вставляется напрямую для локального теста
-TOKEN = os.environ.get('BOT_TOKEN', 'ВАШ_ТОКЕН_BOTFATHER')
+TOKEN = os.environ.get('BOT_TOKEN', '8922084961:AAHlP2EmFhGIPLQ3zz8vj2eB9ORLMGMNOIs')
 bot = telebot.TeleBot(TOKEN)
 
 # Хранилище описаний в памяти
