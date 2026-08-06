@@ -14,7 +14,6 @@ TOKEN = '8922084961:AAEsofBAFeqY8TrZNJR-gjtabC_UaLmZ1mE'
 
 bot = telebot.TeleBot(TOKEN)
 
-# Инициализация базы данных SQLite
 def init_db():
     conn = sqlite3.connect('rent_bot.db')
     cursor = conn.cursor()
@@ -26,22 +25,29 @@ def init_db():
             price TEXT,
             czynsz TEXT,
             url TEXT,
-            description TEXT
+            description TEXT,
+            photo TEXT
         )
     ''')
+    # Проверка на наличие колонки photo
+    cursor.execute("PRAGMA table_info(listings)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if 'photo' not in columns:
+        cursor.execute("ALTER TABLE listings ADD COLUMN photo TEXT")
+    
     conn.commit()
     conn.close()
 
 init_db()
 
-def save_listing(user_id, title, price, czynsz, url, description):
+def save_listing(user_id, title, price, czynsz, url, description, photo):
     conn = sqlite3.connect('rent_bot.db')
     cursor = conn.cursor()
     cursor.execute('DELETE FROM listings WHERE user_id = ? AND url = ?', (user_id, url))
     cursor.execute('''
-        INSERT INTO listings (user_id, title, price, czynsz, url, description)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (user_id, title, price, czynsz, url, description))
+        INSERT INTO listings (user_id, title, price, czynsz, url, description, photo)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (user_id, title, price, czynsz, url, description, photo))
     item_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -57,7 +63,7 @@ def delete_listing(item_id, user_id):
 def get_user_listings(user_id):
     conn = sqlite3.connect('rent_bot.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT id, title, price, czynsz, url FROM listings WHERE user_id = ? ORDER BY id DESC', (user_id,))
+    cursor.execute('SELECT id, title, price, czynsz, url, photo FROM listings WHERE user_id = ? ORDER BY id DESC', (user_id,))
     rows = cursor.fetchall()
     conn.close()
     return rows
@@ -79,6 +85,20 @@ COOKIES = {
     'data_protection_consent': 'true'
 }
 
+def clean_photo_url(url, domain):
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip()
+    if url.startswith('//'):
+        url = 'https:' + url
+    elif url.startswith('/'):
+        parsed = urlparse(domain)
+        url = f"{parsed.scheme}://{parsed.netloc}{url}"
+    
+    if url.startswith(('http://', 'https://')):
+        return url
+    return None
+
 def get_page_html(url):
     clean_url = url.split('?')[0]
     headers = {
@@ -88,13 +108,13 @@ def get_page_html(url):
     }
     
     try:
-        res = scraper.get(clean_url, headers=headers, cookies=COOKIES, timeout=15)
+        res = scraper.get(clean_url, headers=headers, cookies=COOKIES, timeout=10)
         if 'olx.pl' in clean_url and ('Ogłoszenia - Sprzedam' in res.text or 'd/oferta/' not in res.url):
             mobile_headers = {
                 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Safari/604.1',
                 'Accept-Language': 'pl-PL,pl;q=0.9'
             }
-            res_m = scraper.get(clean_url, headers=mobile_headers, cookies=COOKIES, timeout=15)
+            res_m = scraper.get(clean_url, headers=mobile_headers, cookies=COOKIES, timeout=10)
             if res_m.status_code == 200:
                 return res_m.text, clean_url
 
@@ -108,10 +128,25 @@ def get_page_html(url):
 def find_czynsz_in_text(text):
     if not text:
         return None
-    match = re.search(r'(?:czynsz|opłaty\s+administracyjne|opłaty\s+dodatkowe)\s*[:\-]?\s*(\d[\d\s\.]*)\s*(zł|PLN)', text, re.IGNORECASE)
-    if match:
-        return f"{match.group(1).strip()} {match.group(2)}"
+    patterns = [
+        r'(?:czynsz|opłaty\s+administracyjne|opłaty\s+dodatkowe|opłaty|media)\s*[:\-]?\s*(\d[\d\s\,\.]*)\s*(zł|PLN)',
+        r'(\d[\d\s\,\.]*)\s*(zł|PLN)\s*(?:czynsz|opłat|media)'
+    ]
+    for pat in patterns:
+        match = re.search(pat, text, re.IGNORECASE)
+        if match:
+            return f"{match.group(1).strip()} {match.group(2)}"
     return None
+
+def check_is_active(url):
+    html, clean_url = get_page_html(url)
+    if not html:
+        return False
+    if 'olx.pl' in url and ('Ogłoszenia - Sprzedam' in html or 'd/oferta/' not in clean_url):
+        return False
+    if 'To ogłoszenie nie jest już dostępne' in html or 'Ogłoszenie nieaktualne' in html or '404' in html:
+        return False
+    return True
 
 # ==============================================================================
 # ПАРСЕРЫ
@@ -142,8 +177,8 @@ def parse_otodom(soup):
                     img_url = img.get('large') or img.get('medium') or img.get('small')
                     if img_url:
                         photos.append(img_url)
-        except Exception as e:
-            print(f"Ошибка Otodom: {e}")
+        except Exception:
+            pass
 
     return title, price, czynsz, description, photos
 
@@ -217,7 +252,7 @@ def parse_olx(soup):
     if len(photos) <= 1:
         for img in soup.find_all('img'):
             src = img.get('src') or img.get('data-src')
-            if src and ('apollo-ireland.akamaized.net' in src or 'olx' in src) and src.startswith('http'):
+            if src and ('apollo-ireland.akamaized.net' in src or 'olx' in src):
                 photos.append(src)
 
     return title, price, czynsz, description, photos
@@ -242,7 +277,10 @@ def parse_nieruchomosci_online(soup):
                                 price = f"{p} PLN"
                         if 'image' in item:
                             imgs = item['image'] if isinstance(item['image'], list) else [item['image']]
-                            photos.extend([i.get('contentUrl', i) if isinstance(i, dict) else i for i in imgs])
+                            for i in imgs:
+                                photo_url = i.get('contentUrl', i) if isinstance(i, dict) else i
+                                if photo_url:
+                                    photos.append(photo_url)
             except Exception:
                 pass
 
@@ -261,12 +299,10 @@ def parse_nieruchomosci_online(soup):
         if d_elem:
             description = d_elem.get_text(separator='\n', strip=True)
 
-    if len(photos) <= 1:
-        for a in soup.find_all(['a', 'img']):
-            href = a.get('href') or a.get('src') or a.get('data-src')
-            if href and ('/photo/' in href or '/media/' in href or 'img' in href) and href.startswith('http'):
-                if href not in photos and not href.endswith(('.svg', '.png')) and 'logo' not in href:
-                    photos.append(href)
+    for img in soup.find_all('img'):
+        src = img.get('src') or img.get('data-src') or img.get('data-lazy')
+        if src and ('photo' in src or 'media' in src or 'images' in src):
+            photos.append(src)
 
     return title, price, czynsz, description, photos
 
@@ -287,7 +323,7 @@ def fetch_listing_data(url):
     elif 'nieruchomosci-online' in domain:
         title, price, czynsz, description, photos = parse_nieruchomosci_online(soup)
 
-    if not title:
+    if not title or title == 'Bez названия':
         og_title = soup.find('meta', property='og:title')
         title = og_title['content'] if og_title and og_title.get('content') else 'Без названия'
 
@@ -303,8 +339,9 @@ def fetch_listing_data(url):
 
     valid_photos = []
     for p in photos:
-        if p and isinstance(p, str) and p.startswith('http') and p not in valid_photos:
-            valid_photos.append(p)
+        cleaned = clean_photo_url(p, clean_url)
+        if cleaned and cleaned not in valid_photos and not cleaned.endswith(('.svg', '.gif')):
+            valid_photos.append(cleaned)
 
     return {
         'title': title or 'Без названия',
@@ -343,12 +380,37 @@ def handle_list_button(message):
         bot.send_message(message.chat.id, "📋 <b>Ваш список сохраненных объектов пуст.</b>", parse_mode='HTML', reply_markup=get_main_keyboard())
         return
 
-    text = f"📋 <b>Сохраненные объекты ({len(listings)}):</b>\n\n"
-    for idx, item in enumerate(listings, start=1):
-        item_id, title, price, czynsz, url = item
-        text += f"{idx}. <b>{title}</b>\n💰 Цена: {price} | Чинш: {czynsz}\n🔗 <a href='{url}'>Ссылка на объявление</a>\n\n"
+    status_msg = bot.send_message(message.chat.id, f"🔄 Проверяю статус объектов ({len(listings)} шт.)...")
 
-    bot.send_message(message.chat.id, text, parse_mode='HTML', disable_web_page_preview=True, reply_markup=get_main_keyboard())
+    for item in listings:
+        item_id, title, price, czynsz, url, photo = item
+        is_active = check_is_active(url)
+        status_str = "🟢 <b>Активно</b>" if is_active else "🔴 <b>Завершено / Неактивно</b>"
+
+        card_text = (
+            f"Статус: {status_str}\n\n"
+            f"🏠 <b>{title}</b>\n"
+            f"💰 <b>Цена:</b> {price}\n"
+            f"🏷 <b>Чинш / Opłaty:</b> {czynsz}"
+        )
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔗 Открыть на сайте", url=url))
+        markup.add(types.InlineKeyboardButton("🗑 Удалить из базы", callback_data=f"del_{item_id}"))
+
+        if photo:
+            try:
+                bot.send_photo(message.chat.id, photo, caption=card_text, parse_mode='HTML', reply_markup=markup)
+                continue
+            except Exception as e:
+                print(f"Ошибка отправки фото из списка: {e}")
+
+        bot.send_message(message.chat.id, card_text, parse_mode='HTML', reply_markup=markup)
+
+    try:
+        bot.delete_message(message.chat.id, status_msg.message_id)
+    except Exception:
+        pass
 
 @bot.message_handler(func=lambda m: m.text and m.text.startswith(('http://', 'https://')))
 def handle_link(message):
@@ -366,14 +428,16 @@ def handle_link(message):
     except Exception:
         pass
 
-    # Сохраняем в БД SQLite
+    first_photo = data['photos'][0] if data['photos'] else None
+
     item_id = save_listing(
         user_id=message.chat.id,
         title=data['title'],
         price=data['price'],
         czynsz=data['czynsz'],
         url=data['url'],
-        description=data['description']
+        description=data['description'],
+        photo=first_photo
     )
 
     if data['photos']:
@@ -384,7 +448,12 @@ def handle_link(message):
         try:
             bot.send_media_group(message.chat.id, media)
         except Exception as e:
-            print(f"Ошибка отправки фото: {e}")
+            print(f"Ошибка отправки альбома фото: {e}")
+            if first_photo:
+                try:
+                    bot.send_photo(message.chat.id, first_photo)
+                except Exception:
+                    pass
 
     text = (
         f"Статус: 🟢 <b>Сохранено в базу</b>\n\n"
