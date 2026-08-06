@@ -13,7 +13,7 @@ TOKEN = '8922084961:AAEsofBAFeqY8TrZNJR-gjtabC_UaLmZ1mE'
 
 bot = telebot.TeleBot(TOKEN)
 
-# Инициализируем scraper для обхода Cloudflare / DataDome
+# Инициализируем scraper с заголовками и куки для обхода Cookie-wall OLX
 scraper = cloudscraper.create_scraper(
     browser={
         'browser': 'chrome',
@@ -22,19 +22,43 @@ scraper = cloudscraper.create_scraper(
     }
 )
 
+# Куки для пропуска окон согласия OLX/Otodom
+COOKIES = {
+    'l_obu': '1',
+    'ora_captcha': '0',
+    'data_protection_consent': 'true'
+}
+
 
 def get_page_html(url):
-    """Безопасная загрузка HTML с имитацией реального браузера"""
+    """Загрузка HTML с защитой от редиректа на главную страницу"""
     clean_url = url.split('?')[0]
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
+        'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Referer': 'https://www.google.com/'
+    }
+    
     try:
-        res = scraper.get(clean_url, timeout=15)
+        res = scraper.get(clean_url, headers=headers, cookies=COOKIES, timeout=15)
+        
+        # Если OLX скинул на главную страницу — пробуем с мобильным заголовком
+        if 'olx.pl' in clean_url and ('Ogłoszenia - Sprzedam' in res.text or 'd/oferta/' not in res.url):
+            mobile_headers = {
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1',
+                'Accept-Language': 'pl-PL,pl;q=0.9'
+            }
+            res_m = scraper.get(clean_url, headers=mobile_headers, cookies=COOKIES, timeout=15)
+            if res_m.status_code == 200:
+                return res_m.text, clean_url
+
         if res.status_code == 200:
             return res.text, clean_url
         
         print(f"Ошибка HTTP: {res.status_code}")
         return None, clean_url
     except Exception as e:
-        print(f"Ошибка запроса к {url}: {e}")
+        print(f"Ошибка запроса: {e}")
         return None, clean_url
 
 
@@ -64,7 +88,7 @@ def parse_otodom(soup):
                     if img_url:
                         photos.append(img_url)
         except Exception as e:
-            print(f"Ошибка структуры Otodom: {e}")
+            print(f"Ошибка Otodom JSON: {e}")
 
     return title, price, description, photos
 
@@ -72,39 +96,54 @@ def parse_otodom(soup):
 def parse_olx(soup):
     title, price, description, photos = None, None, None, []
 
-    script = soup.find('script', id='__NEXT_DATA__')
-    if script and script.string:
-        try:
-            data = json.loads(script.string)
-            ad = data.get('props', {}).get('pageProps', {}).get('ad', {})
-            if ad:
-                title = ad.get('title')
-                price_data = ad.get('price', {})
-                price = price_data.get('displayValue')
-                raw_desc = ad.get('description', '')
-                description = BeautifulSoup(raw_desc, 'html.parser').get_text()
+    # 1. Парсинг через JSON блоки OLX (__PRERENDERED_STATE__ или __NEXT_DATA__)
+    for script_id in ['__PRERENDERED_STATE__', '__NEXT_DATA__']:
+        script = soup.find('script', id=script_id)
+        if script and script.string:
+            try:
+                data = json.loads(script.string)
+                ad = None
+                if 'ad' in data:
+                    ad = data.get('ad', {}).get('ad') or data.get('ad')
+                elif 'props' in data:
+                    ad = data.get('props', {}).get('pageProps', {}).get('ad')
 
-                for photo in ad.get('photos', []):
-                    u = photo.get('link') if isinstance(photo, dict) else photo
-                    if u:
-                        photos.append(u.replace('{width}', '1000').replace('{height}', '750'))
-        except Exception as e:
-            print(f"Ошибка JSON OLX: {e}")
+                if ad and isinstance(ad, dict):
+                    title = ad.get('title')
+                    price_data = ad.get('price', {})
+                    if isinstance(price_data, dict):
+                        price = price_data.get('displayValue') or (f"{price_data.get('value')} PLN" if price_data.get('value') else None)
+                    
+                    raw_desc = ad.get('description', '')
+                    if raw_desc:
+                        description = BeautifulSoup(raw_desc, 'html.parser').get_text()
 
-    if not title or not price:
-        og_title = soup.find('meta', property='og:title')
-        og_desc = soup.find('meta', property='og:description')
+                    for photo in ad.get('photos', []):
+                        u = photo.get('link') if isinstance(photo, dict) else photo
+                        if u:
+                            photos.append(str(u).replace('{width}', '1000').replace('{height}', '750'))
+                    break
+            except Exception as e:
+                print(f"Ошибка JSON OLX ({script_id}): {e}")
 
-        raw_title = og_title['content'] if og_title and og_title.get('content') else ''
-        raw_desc = og_desc['content'] if og_desc and og_desc.get('content') else ''
+    # 2. Фолбэк через OpenGraph мета-теги
+    og_title = soup.find('meta', property='og:title')
+    og_desc = soup.find('meta', property='og:description')
 
-        title = title or raw_title
-        description = description or raw_desc
+    raw_title = og_title['content'] if og_title and og_title.get('content') else ''
+    raw_desc = og_desc['content'] if og_desc and og_desc.get('content') else ''
 
-        full_text = f"{raw_title} {raw_desc}"
-        price_match = re.search(r'(\d[\d\s\.]*)\s*(zł|PLN|EUR|\$)', full_text, re.IGNORECASE)
-        if price_match and not price:
-            price = f"{price_match.group(1).strip()} {price_match.group(2)}"
+    # Фильтруем заголовок главной страницы OLX
+    if raw_title and 'Ogłoszenia - Sprzedam' not in raw_title and not title:
+        title = raw_title
+
+    if not description and raw_desc:
+        description = raw_desc
+
+    full_text = f"{title or ''} {description or ''} {raw_title} {raw_desc}"
+    price_match = re.search(r'(\d[\d\s\.]*)\s*(zł|PLN|EUR|\$)', full_text, re.IGNORECASE)
+    if price_match and not price:
+        price = f"{price_match.group(1).strip()} {price_match.group(2)}"
 
     if not photos:
         for meta in soup.find_all('meta', property='og:image'):
@@ -116,7 +155,12 @@ def parse_olx(soup):
 
 def parse_fallback_opengraph(soup):
     og_title = soup.find('meta', property='og:title')
-    title = og_title['content'] if og_title and og_title.get('content') else (soup.title.string if soup.title else 'Без названия')
+    raw_title = og_title['content'] if og_title and og_title.get('content') else (soup.title.string if soup.title else '')
+
+    if 'Ogłoszenia - Sprzedam' in raw_title:
+        title = 'Без названия'
+    else:
+        title = raw_title or 'Без названия'
 
     og_desc = soup.find('meta', property='og:description') or soup.find('meta', attrs={'name': 'description'})
     description = og_desc['content'] if og_desc and og_desc.get('content') else 'Без описания'
@@ -149,7 +193,7 @@ def fetch_listing_data(url):
     elif 'olx' in domain:
         title, price, description, photos = parse_olx(soup)
 
-    if not title:
+    if not title or title == 'Без названия':
         title, price, description, photos = parse_fallback_opengraph(soup)
 
     if description and len(description) > 250:
@@ -184,8 +228,8 @@ def handle_link(message):
 
     data = fetch_listing_data(url)
 
-    if not data:
-        bot.edit_message_text("❌ Не удалось загрузить данные по этой ссылке (сайт заблокировал запрос).", message.chat.id, loading_msg.message_id)
+    if not data or data['title'] == 'Без названия':
+        bot.edit_message_text("❌ Не удалось загрузить данные по этой ссылке.", message.chat.id, loading_msg.message_id)
         return
 
     try:
