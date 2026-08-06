@@ -1,7 +1,7 @@
 import json
 import re
 from urllib.parse import urlparse
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 import telebot
 from telebot import types
@@ -13,48 +13,28 @@ TOKEN = '8922084961:AAEsofBAFeqY8TrZNJR-gjtabC_UaLmZ1mE'
 
 bot = telebot.TeleBot(TOKEN)
 
-# Настройка сессии requests с естественными заголовками браузера
-session = requests.Session()
-session.headers.update({
-    'User-Agent': (
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,'
-        ' like Gecko) Chrome/124.0.0.0 Safari/537.36'
-    ),
-    'Accept': (
-        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
-    ),
-    'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-})
+# Инициализируем scraper для обхода Cloudflare / DataDome
+scraper = cloudscraper.create_scraper(
+    browser={
+        'browser': 'chrome',
+        'platform': 'windows',
+        'desktop': True
+    }
+)
 
 
 def get_page_html(url):
-    """Безопасная загрузка HTML с созданием фолбэков при 403 ошибке"""
+    """Безопасная загрузка HTML с имитацией реального браузера"""
     clean_url = url.split('?')[0]
     try:
-        res = session.get(clean_url, timeout=12)
+        res = scraper.get(clean_url, timeout=15)
         if res.status_code == 200:
             return res.text, clean_url
-
-        # Если получен 403, пробуем подменить User-Agent на мобильное устройство
-        mobile_headers = {
-            'User-Agent': (
-                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X)'
-                ' AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1'
-                ' Mobile/15E148 Safari/604.1'
-            )
-        }
-        res_m = session.get(clean_url, headers=mobile_headers, timeout=12)
-        if res_m.status_code == 200:
-            return res_m.text, clean_url
-
-        print(f'Ошибка HTTP: {res.status_code}')
+        
+        print(f"Ошибка HTTP: {res.status_code}")
         return None, clean_url
-
     except Exception as e:
-        print(f'Ошибка запроса к {url}: {e}')
+        print(f"Ошибка запроса к {url}: {e}")
         return None, clean_url
 
 
@@ -74,21 +54,17 @@ def parse_otodom(soup):
                 p_val = target.get('Price')
                 p_curr = target.get('Currency', 'PLN')
                 if p_val:
-                    price = f'{p_val} {p_curr}'
+                    price = f"{p_val} {p_curr}"
 
                 raw_desc = ad.get('description', '')
                 description = BeautifulSoup(raw_desc, 'html.parser').get_text()
 
                 for img in ad.get('images', []):
-                    img_url = (
-                        img.get('large')
-                        or img.get('medium')
-                        or img.get('small')
-                    )
+                    img_url = img.get('large') or img.get('medium') or img.get('small')
                     if img_url:
                         photos.append(img_url)
         except Exception as e:
-            print(f'Ошибка структуры Otodom: {e}')
+            print(f"Ошибка структуры Otodom: {e}")
 
     return title, price, description, photos
 
@@ -111,33 +87,24 @@ def parse_olx(soup):
                 for photo in ad.get('photos', []):
                     u = photo.get('link') if isinstance(photo, dict) else photo
                     if u:
-                        photos.append(
-                            u.replace('{width}', '1000').replace
-                            ('{height}', '750')
-                        )
+                        photos.append(u.replace('{width}', '1000').replace('{height}', '750'))
         except Exception as e:
-            print(f'Ошибка JSON OLX: {e}')
+            print(f"Ошибка JSON OLX: {e}")
 
     if not title or not price:
         og_title = soup.find('meta', property='og:title')
         og_desc = soup.find('meta', property='og:description')
 
-        raw_title = (
-            og_title['content'] if og_title and og_title.get('content') else ''
-        )
-        raw_desc = (
-            og_desc['content'] if og_desc and og_desc.get('content') else ''
-        )
+        raw_title = og_title['content'] if og_title and og_title.get('content') else ''
+        raw_desc = og_desc['content'] if og_desc and og_desc.get('content') else ''
 
         title = title or raw_title
         description = description or raw_desc
 
-        full_text = f'{raw_title} {raw_desc}'
-        price_match = re.search(
-            r'(\d[\d\s\.]*)\s*(zł|PLN|EUR|\$)', full_text, re.IGNORECASE
-        )
+        full_text = f"{raw_title} {raw_desc}"
+        price_match = re.search(r'(\d[\d\s\.]*)\s*(zł|PLN|EUR|\$)', full_text, re.IGNORECASE)
         if price_match and not price:
-            price = f'{price_match.group(1).strip()} {price_match.group(2)}'
+            price = f"{price_match.group(1).strip()} {price_match.group(2)}"
 
     if not photos:
         for meta in soup.find_all('meta', property='og:image'):
@@ -149,27 +116,15 @@ def parse_olx(soup):
 
 def parse_fallback_opengraph(soup):
     og_title = soup.find('meta', property='og:title')
-    title = (
-        og_title['content']
-        if og_title and og_title.get('content')
-        else (soup.title.string if soup.title else 'Без названия')
-    )
+    title = og_title['content'] if og_title and og_title.get('content') else (soup.title.string if soup.title else 'Без названия')
 
-    og_desc = soup.find('meta', property='og:description') or soup.find(
-        'meta', attrs={'name': 'description'}
-    )
-    description = (
-        og_desc['content']
-        if og_desc and og_desc.get('content')
-        else 'Без описания'
-    )
+    og_desc = soup.find('meta', property='og:description') or soup.find('meta', attrs={'name': 'description'})
+    description = og_desc['content'] if og_desc and og_desc.get('content') else 'Без описания'
 
     price_str = 'Не указана'
-    price_match = re.search(
-        r'(\d[\d\s\.]*)\s*(zł|PLN|EUR|\$)', title + ' ' + description, re.IGNORECASE
-    )
+    price_match = re.search(r'(\d[\d\s\.]*)\s*(zł|PLN|EUR|\$)', title + ' ' + description, re.IGNORECASE)
     if price_match:
-        price_str = f'{price_match.group(1).strip()} {price_match.group(2)}'
+        price_str = f"{price_match.group(1).strip()} {price_match.group(2)}"
 
     photos = []
     for img in soup.find_all('meta', property='og:image'):
@@ -202,12 +157,7 @@ def fetch_listing_data(url):
 
     valid_photos = []
     for p in photos:
-        if (
-            p
-            and isinstance(p, str)
-            and p.startswith('http')
-            and p not in valid_photos
-        ):
+        if p and isinstance(p, str) and p.startswith('http') and p not in valid_photos:
             valid_photos.append(p)
 
     return {
@@ -215,7 +165,7 @@ def fetch_listing_data(url):
         'price': price or 'Не указана',
         'description': description or 'Без описания',
         'photos': valid_photos,
-        'url': clean_url,
+        'url': clean_url
     }
 
 
@@ -224,30 +174,18 @@ def fetch_listing_data(url):
 # ==============================================================================
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(
-        message,
-        '📥 <b>Отправьте ссылку на объявление</b>\nПоддерживаются: Otodom, OLX,'
-        ' Morizon, Gratka и др.',
-        parse_mode='HTML',
-    )
+    bot.reply_to(message, "📥 <b>Отправьте ссылку на объявление</b>\nПоддерживаются: Otodom, OLX, Morizon, Gratka и др.", parse_mode='HTML')
 
 
-@bot.message_handler(
-    func=lambda m: m.text and m.text.startswith(('http://', 'https://'))
-)
+@bot.message_handler(func=lambda m: m.text and m.text.startswith(('http://', 'https://')))
 def handle_link(message):
     url = message.text.strip()
-    loading_msg = bot.send_message(message.chat.id, '⏳ Загрузка данных и фото...')
+    loading_msg = bot.send_message(message.chat.id, "⏳ Загрузка данных и фото...")
 
     data = fetch_listing_data(url)
 
     if not data:
-        bot.edit_message_text(
-            '❌ Не удалось загрузить данные по этой ссылке (сайт заблокировал'
-            ' запрос).',
-            message.chat.id,
-            loading_msg.message_id,
-        )
+        bot.edit_message_text("❌ Не удалось загрузить данные по этой ссылке (сайт заблокировал запрос).", message.chat.id, loading_msg.message_id)
         return
 
     try:
@@ -263,37 +201,31 @@ def handle_link(message):
         try:
             bot.send_media_group(message.chat.id, media)
         except Exception as e:
-            print(f'Ошибка отправки фото: {e}')
+            print(f"Ошибка отправки фото: {e}")
 
     text = (
-        f'Статус: 🟢 <b>Активно</b>\n\n'
-        f'🏠 <b>{data["title"]}</b>\n'
-        f'💰 <b>Цена:</b> {data["price"]}\n\n'
-        f'📝 <b>Описание:</b> {data["description"]}'
+        f"Статус: 🟢 <b>Активно</b>\n\n"
+        f"🏠 <b>{data['title']}</b>\n"
+        f"💰 <b>Цена:</b> {data['price']}\n\n"
+        f"📝 <b>Описание:</b> {data['description']}"
     )
 
     markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton('🔗 Открыть на сайте', url=data['url']))
-    markup.add(
-        types.InlineKeyboardButton(
-            '🗑 Удалить из базы', callback_data='delete_item'
-        )
-    )
+    markup.add(types.InlineKeyboardButton("🔗 Открыть на сайте", url=data['url']))
+    markup.add(types.InlineKeyboardButton("🗑 Удалить из базы", callback_data="delete_item"))
 
-    bot.send_message(
-        message.chat.id, text, parse_mode='HTML', reply_markup=markup
-    )
+    bot.send_message(message.chat.id, text, parse_mode='HTML', reply_markup=markup)
 
 
-@bot.callback_query_handler(func=lambda call: call.data == 'delete_item')
+@bot.callback_query_handler(func=lambda call: call.data == "delete_item")
 def handle_delete(call):
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
-        bot.answer_callback_query(call.id, 'Удалено!')
+        bot.answer_callback_query(call.id, "Удалено!")
     except Exception as e:
-        print(f'Ошибка удаления: {e}')
+        print(f"Ошибка удаления: {e}")
 
 
 if __name__ == '__main__':
-    print('Бот запущен и готов к работе...')
+    print("Бот запущен и готов к работе...")
     bot.infinity_polling()
