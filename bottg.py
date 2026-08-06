@@ -122,6 +122,7 @@ def get_page_html(url):
     clean_url = url.split('?')[0]
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
+        'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
     }
     try:
         res = scraper.get(clean_url, headers=headers, timeout=15)
@@ -148,31 +149,19 @@ def find_czynsz_in_text(text, main_price=None):
 
 def check_is_active(url):
     clean_url = url.split('?')[0]
-    domain = urlparse(clean_url).netloc.lower()
-    
-    if 'olx.pl' in domain:
-        match = re.search(r'-ID([a-zA-Z0-9]+)\.html', clean_url)
-        if match:
-            ad_id = match.group(1)
-            try:
-                # Используем scraper вместо requests
-                api_res = scraper.get(f"https://www.olx.pl/api/v1/offers/{ad_id}", timeout=10)
-                if api_res.status_code == 200:
-                    data = api_res.json().get('data', {})
-                    return data.get('status') == 'active'
-                return False
-            except:
-                pass
-        return False
-        
     html, final_url = get_page_html(clean_url)
     if not html: 
         return True 
     
+    domain = urlparse(final_url).netloc.lower()
     html_lower = html.lower()
     
     if 'otodom.pl' in domain:
         return not ('to ogłoszenie nie jest już dostępne' in html_lower or 'nie znaleziono ogłoszenia' in html_lower)
+    elif 'olx.pl' in domain:
+        if '/d/oferta/' not in final_url and 'olx.pl/d/' not in final_url:
+            return False
+        return not ('ogłoszenie nie jest już dostępne' in html_lower or 'to ogłoszenie nie jest dostępne' in html_lower)
     elif 'nieruchomosci-online.pl' in domain:
         return not ('ogłoszenie wygasło' in html_lower or '404' in html_lower or 'nieaktualne' in html_lower)
     
@@ -211,124 +200,156 @@ def parse_otodom(soup):
             pass
     return title, price, czynsz, description, photos
 
-def parse_olx_api(url):
+def parse_olx(soup, html):
     title, price, czynsz, description, photos = None, None, None, None, []
     
-    match = re.search(r'-ID([a-zA-Z0-9]+)\.html', url)
-    if not match:
-        return None, None, None, None, []
+    # Извлечение через встроенный JSON state
+    state_match = re.search(r'__PRERENDERED_STATE__\s*=\s*(\{.*?\});\s*</script>', html, re.DOTALL)
+    if not state_match:
+        state_match = re.search(r'window\.__PRERENDERED_STATE__\s*=\s*(\{.*?\});', html, re.DOTALL)
         
-    ad_id = match.group(1)
-    api_url = f"https://www.olx.pl/api/v1/offers/{ad_id}"
-    
-    try:
-        # Используем scraper для обхода блокировок OLX (Cloudflare)
-        res = scraper.get(api_url, timeout=10)
-        if res.status_code == 200:
-            data = res.json().get('data', {})
-            
-            title = data.get('title')
-            
-            for param in data.get('params', []):
-                if param.get('key') == 'price':
-                    price_val = param.get('value', {})
-                    price = price_val.get('label')
-                elif param.get('key') == 'rent':
-                    rent_val = param.get('value', {})
-                    czynsz = rent_val.get('label')
-            
-            raw_desc = data.get('description', '')
-            if raw_desc:
-                description = BeautifulSoup(raw_desc.replace('<br>', '\n').replace('<br/>', '\n'), 'html.parser').get_text(separator='\n', strip=True)
+    if state_match:
+        try:
+            json_data = json.loads(state_match.group(1))
+            ad = json_data.get('ad', {}).get('ad', {})
+            if not ad:
+                ad = json_data.get('advert', {})
+            if ad:
+                title = ad.get('title')
                 
-            for photo in data.get('photos', []):
-                link = photo.get('link', '')
-                if link:
-                    photos.append(link.replace('{width}', '1000').replace('{height}', '750'))
-    except Exception as e:
-        print(f"Ошибка OLX API: {e}")
-        
+                price_info = ad.get('price', {})
+                if isinstance(price_info, dict):
+                    price = price_info.get('displayValue') or str(price_info.get('value', ''))
+                elif price_info:
+                    price = str(price_info)
+                    
+                for param in ad.get('params', []):
+                    key = param.get('key', '').lower()
+                    if 'rent' in key or 'czynsz' in key or 'oplaty' in key:
+                        val = param.get('value', {})
+                        if isinstance(val, dict):
+                            czynsz = val.get('label')
+                        else:
+                            czynsz = param.get('normalizedValue') or str(val)
+                            
+                raw_desc = ad.get('description', '')
+                if raw_desc:
+                    description = BeautifulSoup(raw_desc.replace('<br>', '\n').replace('<br/>', '\n'), 'html.parser').get_text(separator='\n', strip=True)
+                    
+                for photo in ad.get('photos', []):
+                    link = photo.get('link') or photo.get('url', '')
+                    if link:
+                        photos.append(link.replace('{width}', '1000').replace('{height}', '750'))
+        except Exception as e:
+            print("OLX JSON Parse Error:", e)
+
+    # HTML фолбэки
+    if not title:
+        h1 = soup.find('h1')
+        if h1: title = h1.get_text(strip=True)
+    if not price:
+        p_elem = soup.find('h3', {'data-testid': 'ad-price-container'}) or soup.find(class_=re.compile(r'price', re.I))
+        if p_elem: price = p_elem.get_text(strip=True)
+    if not description:
+        d_elem = soup.find('div', {'data-cy': 'ad_description'}) or soup.find(class_=re.compile(r'description', re.I))
+        if d_elem: description = d_elem.get_text(separator='\n', strip=True)
+    if not photos:
+        for img in soup.find_all('img'):
+            src = img.get('src') or img.get('data-src')
+            if src and ('olxcdn.com' in src or 'apollo' in src) and not src.endswith(('.svg', '.png')):
+                photos.append(src)
+
     return title, price, czynsz, description, photos
 
 def parse_nieruchomosci_online(soup, html):
     title, price, czynsz, description, photos = None, None, None, None, []
 
-    # 1. Title & Price overrides 
+    # 1. Title
     t_elem = soup.find('h1')
-    if t_elem: title = t_elem.get_text(strip=True)
+    if t_elem: 
+        title = t_elem.get_text(strip=True)
 
-    p_elem = soup.find(class_=re.compile(r'price', re.I))
-    if p_elem: price = p_elem.get_text(strip=True)
+    # 2. Price (строгий поиск блока цены аренды, избегая цены за м2)
+    for p_el in soup.find_all(['span', 'div', 'p'], class_=re.compile(r'price', re.I)):
+        text = p_el.get_text(strip=True)
+        if ('zł' in text.lower() or 'pln' in text.lower()) and 'm²' not in text:
+            # Убедимся, что это не чинш
+            parent_text = p_el.find_parent().get_text(strip=True).lower()
+            if 'czynsz' not in parent_text and 'opłaty' not in parent_text:
+                price = text
+                break
 
-    # 2. Czynsz - жесткий поиск по характеристикам
-    for el in soup.find_all(['li', 'span', 'p']):
-        text = el.get_text(strip=True)
-        if re.search(r'(czynsz|opłaty administracyjne)', text, re.IGNORECASE):
+    # 3. Czynsz (ищем строго в блоках параметров/таблицах)
+    for el in soup.find_all(['li', 'div', 'tr', 'p']):
+        text = el.get_text(strip=True).lower()
+        if 'czynsz' in text or 'opłaty administracyjne' in text:
             match = re.search(r'(\d[\d\s\,\.]*)\s*(zł|pln)', text, re.IGNORECASE)
             if match:
                 found_czynsz = f"{match.group(1).strip()} {match.group(2).lower()}"
-                if price and found_czynsz.replace(' ', '').lower() != price.replace(' ', '').lower():
+                # Жесткая защита от дублирования основной цены в чинш
+                if price and found_czynsz.replace(' ', '') != price.replace(' ', ''):
                     czynsz = found_czynsz
                     break
 
-    # 3. JSON-LD fallback for missing description (описание не трогаем, как и просили)
-    for script in soup.find_all('script', type='application/ld+json'):
-        try:
-            data = json.loads(script.string)
-            if isinstance(data, list): data = data[0]
-            if data.get('@type') in ['Product', 'Offer', 'RealEstateListing', 'Apartment', 'SingleFamilyResidence']:
-                if 'name' in data and not title: title = data['name']
-                if 'description' in data and not description: 
-                    description = BeautifulSoup(data['description'], 'html.parser').get_text(separator='\n', strip=True)
-                if 'offers' in data and isinstance(data['offers'], dict) and not price:
-                    if 'price' in data['offers']:
-                        price = f"{data['offers']['price']} {data['offers'].get('priceCurrency', 'PLN')}"
-        except Exception:
-            continue
+    # 4. Description (берем полный текст из блока описания)
+    desc_box = soup.find('div', id='description') or soup.find('div', class_=re.compile(r'description|desc-content', re.I))
+    if desc_box:
+        for hidden in desc_box.find_all(['span', 'div', 'a'], class_=re.compile(r'hide|button|more', re.I)):
+            hidden.decompose()
+        description = desc_box.get_text(separator='\n', strip=True)
 
+    # Если через HTML не нашлось, пробуем JSON-LD
     if not description:
-        desc_box = soup.find('div', id='description') or soup.find('div', class_=re.compile(r'description', re.I))
-        if desc_box:
-            description = desc_box.get_text(separator='\n', strip=True)
+        for script in soup.find_all('script', type='application/ld+json'):
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, list): data = data[0]
+                if data.get('@type') in ['Product', 'Offer', 'RealEstateListing', 'Apartment', 'SingleFamilyResidence']:
+                    if 'description' in data:
+                        description = BeautifulSoup(data['description'], 'html.parser').get_text(separator='\n', strip=True)
+            except Exception:
+                continue
 
-    # 4. Photos - сбор ВСЕХ фотографий вместо 3
+    # 5. Photos (собираем все картинки из галереи)
     for a in soup.find_all('a'):
         href = a.get('href') or a.get('data-src')
         classes = str(a.get('class', [])).lower()
-        if href and ('/large/' in href or '/orig/' in href or 'gallery' in classes or 'fancybox' in classes):
+        if href and ('/large/' in href or '/orig/' in href or 'gallery' in classes or 'fancybox' in classes or 'photo' in classes):
             if href.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                 photos.append(href)
-    
-    if len(photos) < 4:
+                
+    if not photos:
         for img in soup.find_all('img'):
             src = img.get('data-src') or img.get('src')
-            if src and ('/large/' in src or '/big/' in src or 'oferta' in src) and not src.lower().endswith(('.svg', '.gif')):
+            if src and ('/large/' in src or '/big/' in src or '/oferty/' in src or 'photo' in src.lower()) and not src.lower().endswith(('.svg', '.gif', '.png')):
                 photos.append(src)
 
     return title, price, czynsz, description, photos
 
 def fetch_listing_data(url):
     clean_url = url.split('?')[0]
-    domain = urlparse(clean_url).netloc.lower()
+    html, final_url = get_page_html(clean_url)
+    if not html:
+        return None
 
-    if 'olx.pl' in domain:
-        title, price, czynsz, description, photos = parse_olx_api(clean_url)
-        final_url = clean_url
+    soup = BeautifulSoup(html, 'html.parser')
+    domain = urlparse(final_url).netloc.lower()
+
+    if 'otodom' in domain:
+        title, price, czynsz, description, photos = parse_otodom(soup)
+    elif 'olx' in domain:
+        title, price, czynsz, description, photos = parse_olx(soup, html)
+    elif 'nieruchomosci-online' in domain:
+        title, price, czynsz, description, photos = parse_nieruchomosci_online(soup, html)
     else:
-        html, final_url = get_page_html(clean_url)
-        if not html:
-            return None
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        if 'otodom' in domain:
-            title, price, czynsz, description, photos = parse_otodom(soup)
-        elif 'nieruchomosci-online' in domain:
-            title, price, czynsz, description, photos = parse_nieruchomosci_online(soup, html)
-        else:
-            title, price, czynsz, description, photos = None, None, None, None, []
+        title, price, czynsz, description, photos = None, None, None, None, []
 
     if not czynsz and description:
         czynsz = find_czynsz_in_text(description, price)
+
+    # Финальная страховка: если чинш случайно стал равен цене, сбрасываем его
+    if czynsz and price and czynsz.replace(' ', '').lower() == price.replace(' ', '').lower():
+        czynsz = 'Не указан'
 
     valid_photos = []
     seen = set()
