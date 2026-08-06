@@ -6,77 +6,129 @@ from bs4 import BeautifulSoup
 import telebot
 from telebot import types
 
-TOKEN = '8922084961:AAHlp2EmFhGIPLQ3zz8vj2eB9ORLMGMNOIs'  # Твой токен
+# ==============================================================================
+# НАСТРОЙКИ
+# ==============================================================================
+# Вставь сюда свой актуальный токен из BotFather
+TOKEN = '8922084961:AAEsofBAFeqY8TrZNJR-gjtabC_UaLmZ1mE'
+
 bot = telebot.TeleBot(TOKEN)
 
+# Браузерные заголовки для обхода защиты OLX и Otodom
 HEADERS = {
     'User-Agent': (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,'
-        ' like Gecko) Chrome/125.0.0.0 Safari/537.36'
+        ' like Gecko) Chrome/127.0.0.0 Safari/537.36'
+    ),
+    'Accept': (
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
     ),
     'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Sec-Ch-Ua': (
+        '"Not)A;Brand";v="99", "Google Chrome";v="127", "Chromium";v="127"'
+    ),
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
 }
 
 
-# ----------------------------------------------------------------------
-# ПАРСЕРЫ С ВЫТАСКИВАНИЕМ ФОТО
-# ----------------------------------------------------------------------
+# ==============================================================================
+# ПАРСЕРЫ САЙТОВ
+# ==============================================================================
 def parse_otodom(soup):
+    """Парсинг Otodom"""
+    title, price, description, photos = None, None, None, []
     script = soup.find('script', id='__NEXT_DATA__')
     if script and script.string:
-        data = json.loads(script.string)
-        ad = data.get('props', {}).get('pageProps', {}).get('ad', {})
-        if ad:
-            title = ad.get('title', 'Без названия')
-            target = ad.get('target', {})
-            price = target.get('Price', '')
-            currency = target.get('Currency', 'PLN')
-            price_str = f'{price} {currency}' if price else 'Не указана'
+        try:
+            data = json.loads(script.string)
+            ad = data.get('props', {}).get('pageProps', {}).get('ad', {})
+            if ad:
+                title = ad.get('title')
+                target = ad.get('target', {})
+                p_val = target.get('Price')
+                p_curr = target.get('Currency', 'PLN')
+                if p_val:
+                    price = f'{p_val} {p_curr}'
 
-            raw_desc = ad.get('description', '')
-            clean_desc = BeautifulSoup(raw_desc, 'html.parser').get_text()
+                raw_desc = ad.get('description', '')
+                description = BeautifulSoup(raw_desc, 'html.parser').get_text()
 
-            # Достаем все ссылки на фото
-            photos = []
-            for img in ad.get('images', []):
-                img_url = (
-                    img.get('large') or img.get('medium') or img.get('small')
-                )
-                if img_url:
-                    photos.append(img_url)
+                for img in ad.get('images', []):
+                    img_url = (
+                        img.get('large')
+                        or img.get('medium')
+                        or img.get('small')
+                    )
+                    if img_url:
+                        photos.append(img_url)
+        except Exception as e:
+            print(f'Ошибка структуры Otodom: {e}')
 
-            return title, price_str, clean_desc, photos
-    return None, None, None, []
+    return title, price, description, photos
 
 
 def parse_olx(soup):
+    """Парсинг OLX"""
+    title, price, description, photos = None, None, None, []
+
+    # 1. Попытка через __NEXT_DATA__
     script = soup.find('script', id='__NEXT_DATA__')
     if script and script.string:
-        data = json.loads(script.string)
-        ad = data.get('props', {}).get('pageProps', {}).get('ad', {})
-        if ad:
-            title = ad.get('title', 'Без названия')
-            price_data = ad.get('price', {})
-            price_str = price_data.get('displayValue', 'Не указана')
+        try:
+            data = json.loads(script.string)
+            ad = data.get('props', {}).get('pageProps', {}).get('ad', {})
+            if ad:
+                title = ad.get('title')
+                price_data = ad.get('price', {})
+                price = price_data.get('displayValue')
+                raw_desc = ad.get('description', '')
+                description = BeautifulSoup(raw_desc, 'html.parser').get_text()
 
-            raw_desc = ad.get('description', '')
-            clean_desc = BeautifulSoup(raw_desc, 'html.parser').get_text()
+                for photo in ad.get('photos', []):
+                    u = photo.get('link') if isinstance(photo, dict) else photo
+                    if u:
+                        photos.append(
+                            u.replace('{width}', '1000').replace
+                            ('{height}', '750')
+                        )
+        except Exception as e:
+            print(f'Ошибка структуры OLX: {e}')
 
-            # Достаем все фото OLX
-            photos = []
-            for photo in ad.get('photos', []):
-                url = photo.get('link') if isinstance(photo, dict) else photo
-                if url:
-                    url = url.replace('{width}', '1000').replace(
-                        '{height}', '750'
-                    )
-                    photos.append(url)
+    # 2. Резервный парсинг через OpenGraph (если JSON заблокирован)
+    if not title or not price:
+        og_title = soup.find('meta', property='og:title')
+        og_desc = soup.find('meta', property='og:description')
 
-            return title, price_str, clean_desc, photos
-    return None, None, None, []
+        raw_title = (
+            og_title['content'] if og_title and og_title.get('content') else ''
+        )
+        raw_desc = (
+            og_desc['content'] if og_desc and og_desc.get('content') else ''
+        )
+
+        title = title or raw_title
+        description = description or raw_desc
+
+        full_text = f'{raw_title} {raw_desc}'
+        price_match = re.search(
+            r'(\d[\d\s\.]*)\s*(zł|PLN|EUR|\$)', full_text, re.IGNORECASE
+        )
+        if price_match and not price:
+            price = f'{price_match.group(1).strip()} {price_match.group(2)}'
+
+    if not photos:
+        for meta in soup.find_all('meta', property='og:image'):
+            if meta.get('content'):
+                photos.append(meta['content'])
+
+    return title, price, description, photos
 
 
 def parse_fallback_opengraph(soup):
+    """Универсальный парсер для Morizon, Gratka, Nieruchomosci-online и др."""
     og_title = soup.find('meta', property='og:title')
     title = (
         og_title['content']
@@ -100,57 +152,77 @@ def parse_fallback_opengraph(soup):
     if price_match:
         price_str = f'{price_match.group(1).strip()} {price_match.group(2)}'
 
-    # Собираем мета-картинки
     photos = []
-    og_images = soup.find_all('meta', property='og:image')
-    for img in og_images:
+    for img in soup.find_all('meta', property='og:image'):
         if img.get('content'):
             photos.append(img['content'])
 
     return title.strip(), price_str, description.strip(), photos
 
 
+# ==============================================================================
+# ГЛАВНАЯ ФУНКЦИЯ ОБРАБОТКИ
+# ==============================================================================
 def fetch_listing_data(url):
     try:
-        res = requests.get(url, headers=HEADERS, timeout=12)
+        # Очищаем ссылку от лишних UTM-параметров
+        clean_url = url.split('?')[0]
+
+        res = requests.get(clean_url, headers=HEADERS, timeout=12)
         if res.status_code != 200:
+            print(f'Ошибка HTTP: {res.status_code}')
             return None
 
         soup = BeautifulSoup(res.text, 'html.parser')
-        domain = urlparse(url).netloc.lower()
+        domain = urlparse(clean_url).netloc.lower()
+
+        title, price, description, photos = None, None, None, []
 
         if 'otodom' in domain:
             title, price, description, photos = parse_otodom(soup)
         elif 'olx' in domain:
             title, price, description, photos = parse_olx(soup)
-        else:
-            title, price, description, photos = parse_fallback_opengraph(soup)
 
+        # Если специализированный парсер не сработал — включаем универсальный
         if not title:
             title, price, description, photos = parse_fallback_opengraph(soup)
 
-        if description and len(description) > 200:
-            description = description[:200] + '...'
+        if description and len(description) > 250:
+            description = description[:250] + '...'
+
+        # Фильтрация ссылок на картинки
+        valid_photos = []
+        for p in photos:
+            if (
+                p
+                and isinstance(p, str)
+                and p.startswith('http')
+                and p not in valid_photos
+            ):
+                valid_photos.append(p)
 
         return {
             'title': title or 'Без названия',
             'price': price or 'Не указана',
             'description': description or 'Без описания',
-            'photos': photos or [],
-            'url': url,
+            'photos': valid_photos,
+            'url': clean_url,
         }
     except Exception as e:
-        print(f'Ошибка запроса к {url}: {e}')
+        print(f'Ошибка парсинга ссылки: {e}')
         return None
 
 
-# ----------------------------------------------------------------------
-# ХЭНДЛЕР
-# ----------------------------------------------------------------------
-@bot.message_handler(commands=['start', 'add'])
+# ==============================================================================
+# ХЭНДЛЕРЫ TELEGRAM
+# ==============================================================================
+@bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     bot.reply_to(
-        message, '📥 Отправьте ссылку на объявление (Otodom, OLX и др.):'
+        message,
+        '📥 <b>Отправьте ссылку на объявление</b>\nПоддерживаются: Otodom, OLX,'
+        ' Morizon, Gratka и др.',
+        parse_mode='HTML',
     )
 
 
@@ -159,7 +231,7 @@ def send_welcome(message):
 )
 def handle_link(message):
     url = message.text.strip()
-    msg = bot.send_message(message.chat.id, '⏳ Загрузка данных и фото...')
+    loading_msg = bot.send_message(message.chat.id, '⏳ Загрузка данных и фото...')
 
     data = fetch_listing_data(url)
 
@@ -167,13 +239,17 @@ def handle_link(message):
         bot.edit_message_text(
             '❌ Не удалось загрузить данные по этой ссылке.',
             message.chat.id,
-            msg.message_id,
+            loading_msg.message_id,
         )
         return
 
-    bot.delete_message(message.chat.id, msg.message_id)
+    # Удаляем временное сообщение о загрузке
+    try:
+        bot.delete_message(message.chat.id, loading_msg.message_id)
+    except Exception:
+        pass
 
-    # 1. Отправляем фото альбомом (максимум 10 штук из-за лимита Telegram API)
+    # 1. Отправляем альбом фотографий (до 10 шт)
     if data['photos']:
         media = []
         for photo_url in data['photos'][:10]:
@@ -184,7 +260,7 @@ def handle_link(message):
         except Exception as e:
             print(f'Не удалось отправить фото: {e}')
 
-    # 2. Отправляем карточку с текстом и кнопками
+    # 2. Отправляем карточку объявления
     text = (
         f'Статус: 🟢 <b>Активно</b>\n\n'
         f'🏠 <b>{data["title"]}</b>\n'
@@ -205,6 +281,15 @@ def handle_link(message):
     )
 
 
+@bot.callback_query_handler(func=lambda call: call.data == 'delete_item')
+def handle_delete(call):
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+        bot.answer_callback_query(call.id, 'Удалено!')
+    except Exception as e:
+        print(f'Ошибка удаления: {e}')
+
+
 if __name__ == '__main__':
-    print('Бот запущен...')
+    print('Бот запущен и готов к работе...')
     bot.infinity_polling()
