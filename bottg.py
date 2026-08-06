@@ -9,36 +9,59 @@ from telebot import types
 # ==============================================================================
 # НАСТРОЙКИ
 # ==============================================================================
-# Вставь сюда свой актуальный токен из BotFather
 TOKEN = '8922084961:AAEsofBAFeqY8TrZNJR-gjtabC_UaLmZ1mE'
 
 bot = telebot.TeleBot(TOKEN)
 
-# Браузерные заголовки для обхода защиты OLX и Otodom
-HEADERS = {
+# Настройка сессии requests с естественными заголовками браузера
+session = requests.Session()
+session.headers.update({
     'User-Agent': (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,'
-        ' like Gecko) Chrome/127.0.0.0 Safari/537.36'
+        ' like Gecko) Chrome/124.0.0.0 Safari/537.36'
     ),
     'Accept': (
-        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
     ),
     'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Sec-Ch-Ua': (
-        '"Not)A;Brand";v="99", "Google Chrome";v="127", "Chromium";v="127"'
-    ),
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': '"Windows"',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-}
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+})
+
+
+def get_page_html(url):
+    """Безопасная загрузка HTML с созданием фолбэков при 403 ошибке"""
+    clean_url = url.split('?')[0]
+    try:
+        res = session.get(clean_url, timeout=12)
+        if res.status_code == 200:
+            return res.text, clean_url
+
+        # Если получен 403, пробуем подменить User-Agent на мобильное устройство
+        mobile_headers = {
+            'User-Agent': (
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X)'
+                ' AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1'
+                ' Mobile/15E148 Safari/604.1'
+            )
+        }
+        res_m = session.get(clean_url, headers=mobile_headers, timeout=12)
+        if res_m.status_code == 200:
+            return res_m.text, clean_url
+
+        print(f'Ошибка HTTP: {res.status_code}')
+        return None, clean_url
+
+    except Exception as e:
+        print(f'Ошибка запроса к {url}: {e}')
+        return None, clean_url
 
 
 # ==============================================================================
-# ПАРСЕРЫ САЙТОВ
+# ПАРСЕРЫ
 # ==============================================================================
 def parse_otodom(soup):
-    """Парсинг Otodom"""
     title, price, description, photos = None, None, None, []
     script = soup.find('script', id='__NEXT_DATA__')
     if script and script.string:
@@ -71,10 +94,8 @@ def parse_otodom(soup):
 
 
 def parse_olx(soup):
-    """Парсинг OLX"""
     title, price, description, photos = None, None, None, []
 
-    # 1. Попытка через __NEXT_DATA__
     script = soup.find('script', id='__NEXT_DATA__')
     if script and script.string:
         try:
@@ -95,9 +116,8 @@ def parse_olx(soup):
                             ('{height}', '750')
                         )
         except Exception as e:
-            print(f'Ошибка структуры OLX: {e}')
+            print(f'Ошибка JSON OLX: {e}')
 
-    # 2. Резервный парсинг через OpenGraph (если JSON заблокирован)
     if not title or not price:
         og_title = soup.find('meta', property='og:title')
         og_desc = soup.find('meta', property='og:description')
@@ -128,7 +148,6 @@ def parse_olx(soup):
 
 
 def parse_fallback_opengraph(soup):
-    """Универсальный парсер для Morizon, Gratka, Nieruchomosci-online и др."""
     og_title = soup.find('meta', property='og:title')
     title = (
         og_title['content']
@@ -160,61 +179,48 @@ def parse_fallback_opengraph(soup):
     return title.strip(), price_str, description.strip(), photos
 
 
-# ==============================================================================
-# ГЛАВНАЯ ФУНКЦИЯ ОБРАБОТКИ
-# ==============================================================================
 def fetch_listing_data(url):
-    try:
-        # Очищаем ссылку от лишних UTM-параметров
-        clean_url = url.split('?')[0]
-
-        res = requests.get(clean_url, headers=HEADERS, timeout=12)
-        if res.status_code != 200:
-            print(f'Ошибка HTTP: {res.status_code}')
-            return None
-
-        soup = BeautifulSoup(res.text, 'html.parser')
-        domain = urlparse(clean_url).netloc.lower()
-
-        title, price, description, photos = None, None, None, []
-
-        if 'otodom' in domain:
-            title, price, description, photos = parse_otodom(soup)
-        elif 'olx' in domain:
-            title, price, description, photos = parse_olx(soup)
-
-        # Если специализированный парсер не сработал — включаем универсальный
-        if not title:
-            title, price, description, photos = parse_fallback_opengraph(soup)
-
-        if description and len(description) > 250:
-            description = description[:250] + '...'
-
-        # Фильтрация ссылок на картинки
-        valid_photos = []
-        for p in photos:
-            if (
-                p
-                and isinstance(p, str)
-                and p.startswith('http')
-                and p not in valid_photos
-            ):
-                valid_photos.append(p)
-
-        return {
-            'title': title or 'Без названия',
-            'price': price or 'Не указана',
-            'description': description or 'Без описания',
-            'photos': valid_photos,
-            'url': clean_url,
-        }
-    except Exception as e:
-        print(f'Ошибка парсинга ссылки: {e}')
+    html, clean_url = get_page_html(url)
+    if not html:
         return None
 
+    soup = BeautifulSoup(html, 'html.parser')
+    domain = urlparse(clean_url).netloc.lower()
+
+    title, price, description, photos = None, None, None, []
+
+    if 'otodom' in domain:
+        title, price, description, photos = parse_otodom(soup)
+    elif 'olx' in domain:
+        title, price, description, photos = parse_olx(soup)
+
+    if not title:
+        title, price, description, photos = parse_fallback_opengraph(soup)
+
+    if description and len(description) > 250:
+        description = description[:250] + '...'
+
+    valid_photos = []
+    for p in photos:
+        if (
+            p
+            and isinstance(p, str)
+            and p.startswith('http')
+            and p not in valid_photos
+        ):
+            valid_photos.append(p)
+
+    return {
+        'title': title or 'Без названия',
+        'price': price or 'Не указана',
+        'description': description or 'Без описания',
+        'photos': valid_photos,
+        'url': clean_url,
+    }
+
 
 # ==============================================================================
-# ХЭНДЛЕРЫ TELEGRAM
+# TELEGRAM ОБРАБОТЧИКИ
 # ==============================================================================
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
@@ -237,19 +243,18 @@ def handle_link(message):
 
     if not data:
         bot.edit_message_text(
-            '❌ Не удалось загрузить данные по этой ссылке.',
+            '❌ Не удалось загрузить данные по этой ссылке (сайт заблокировал'
+            ' запрос).',
             message.chat.id,
             loading_msg.message_id,
         )
         return
 
-    # Удаляем временное сообщение о загрузке
     try:
         bot.delete_message(message.chat.id, loading_msg.message_id)
     except Exception:
         pass
 
-    # 1. Отправляем альбом фотографий (до 10 шт)
     if data['photos']:
         media = []
         for photo_url in data['photos'][:10]:
@@ -258,9 +263,8 @@ def handle_link(message):
         try:
             bot.send_media_group(message.chat.id, media)
         except Exception as e:
-            print(f'Не удалось отправить фото: {e}')
+            print(f'Ошибка отправки фото: {e}')
 
-    # 2. Отправляем карточку объявления
     text = (
         f'Статус: 🟢 <b>Активно</b>\n\n'
         f'🏠 <b>{data["title"]}</b>\n'
