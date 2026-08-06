@@ -1,7 +1,6 @@
 import json
 import re
 import sqlite3
-import requests
 from urllib.parse import urlparse
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -151,13 +150,13 @@ def check_is_active(url):
     clean_url = url.split('?')[0]
     domain = urlparse(clean_url).netloc.lower()
     
-    # Идеальная проверка для OLX через их API
     if 'olx.pl' in domain:
         match = re.search(r'-ID([a-zA-Z0-9]+)\.html', clean_url)
         if match:
             ad_id = match.group(1)
             try:
-                api_res = requests.get(f"https://www.olx.pl/api/v1/offers/{ad_id}", timeout=10)
+                # Используем scraper вместо requests
+                api_res = scraper.get(f"https://www.olx.pl/api/v1/offers/{ad_id}", timeout=10)
                 if api_res.status_code == 200:
                     data = api_res.json().get('data', {})
                     return data.get('status') == 'active'
@@ -223,13 +222,13 @@ def parse_olx_api(url):
     api_url = f"https://www.olx.pl/api/v1/offers/{ad_id}"
     
     try:
-        res = requests.get(api_url, timeout=10)
+        # Используем scraper для обхода блокировок OLX (Cloudflare)
+        res = scraper.get(api_url, timeout=10)
         if res.status_code == 200:
             data = res.json().get('data', {})
             
             title = data.get('title')
             
-            # Парсинг цены и чинша из параметров API
             for param in data.get('params', []):
                 if param.get('key') == 'price':
                     price_val = param.get('value', {})
@@ -254,53 +253,57 @@ def parse_olx_api(url):
 def parse_nieruchomosci_online(soup, html):
     title, price, czynsz, description, photos = None, None, None, None, []
 
-    # 1. Попытка вытащить данные через скрытую микроразметку JSON-LD (самый надежный способ)
+    # 1. Title & Price overrides 
+    t_elem = soup.find('h1')
+    if t_elem: title = t_elem.get_text(strip=True)
+
+    p_elem = soup.find(class_=re.compile(r'price', re.I))
+    if p_elem: price = p_elem.get_text(strip=True)
+
+    # 2. Czynsz - жесткий поиск по характеристикам
+    for el in soup.find_all(['li', 'span', 'p']):
+        text = el.get_text(strip=True)
+        if re.search(r'(czynsz|opłaty administracyjne)', text, re.IGNORECASE):
+            match = re.search(r'(\d[\d\s\,\.]*)\s*(zł|pln)', text, re.IGNORECASE)
+            if match:
+                found_czynsz = f"{match.group(1).strip()} {match.group(2).lower()}"
+                if price and found_czynsz.replace(' ', '').lower() != price.replace(' ', '').lower():
+                    czynsz = found_czynsz
+                    break
+
+    # 3. JSON-LD fallback for missing description (описание не трогаем, как и просили)
     for script in soup.find_all('script', type='application/ld+json'):
         try:
             data = json.loads(script.string)
-            if isinstance(data, list):
-                data = data[0]
-            if data.get('@type') in ['Product', 'Offer', 'RealEstateListing', 'Apartment']:
-                if 'name' in data and not title: 
-                    title = data['name']
+            if isinstance(data, list): data = data[0]
+            if data.get('@type') in ['Product', 'Offer', 'RealEstateListing', 'Apartment', 'SingleFamilyResidence']:
+                if 'name' in data and not title: title = data['name']
                 if 'description' in data and not description: 
                     description = BeautifulSoup(data['description'], 'html.parser').get_text(separator='\n', strip=True)
                 if 'offers' in data and isinstance(data['offers'], dict) and not price:
                     if 'price' in data['offers']:
                         price = f"{data['offers']['price']} {data['offers'].get('priceCurrency', 'PLN')}"
-                if 'image' in data:
-                    if isinstance(data['image'], list): photos.extend(data['image'])
-                    elif isinstance(data['image'], str): photos.append(data['image'])
         except Exception:
             continue
-
-    # 2. Фолбэки, если JSON-LD не сработал или пустой
-    if not title:
-        t_elem = soup.find('h1')
-        if t_elem: title = t_elem.get_text(strip=True)
-
-    if not price:
-        p_elem = soup.find(class_=re.compile(r'price', re.I))
-        if p_elem: 
-            price = p_elem.get_text(strip=True)
 
     if not description:
         desc_box = soup.find('div', id='description') or soup.find('div', class_=re.compile(r'description', re.I))
         if desc_box:
-            for hidden in desc_box.find_all(['span', 'div', 'a'], class_=re.compile(r'hide|button|more', re.I)):
-                hidden.decompose()
             description = desc_box.get_text(separator='\n', strip=True)
 
-    if not photos:
-        for a in soup.find_all('a', href=re.compile(r'\.(jpg|jpeg|png)', re.I)):
-            href = a.get('href')
-            if 'gallery' in str(a.get('data-fancybox', '')) or 'gallery' in str(a.get('rel', '')) or '/large/' in href:
+    # 4. Photos - сбор ВСЕХ фотографий вместо 3
+    for a in soup.find_all('a'):
+        href = a.get('href') or a.get('data-src')
+        classes = str(a.get('class', [])).lower()
+        if href and ('/large/' in href or '/orig/' in href or 'gallery' in classes or 'fancybox' in classes):
+            if href.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                 photos.append(href)
-        if not photos:
-            for img in soup.find_all('img'):
-                src = img.get('data-src') or img.get('src')
-                if src and ('/large/' in src or '/big/' in src or 'oferta' in src) and src.lower().endswith(('.jpg', '.jpeg', '.png')):
-                    photos.append(src)
+    
+    if len(photos) < 4:
+        for img in soup.find_all('img'):
+            src = img.get('data-src') or img.get('src')
+            if src and ('/large/' in src or '/big/' in src or 'oferta' in src) and not src.lower().endswith(('.svg', '.gif')):
+                photos.append(src)
 
     return title, price, czynsz, description, photos
 
@@ -308,7 +311,6 @@ def fetch_listing_data(url):
     clean_url = url.split('?')[0]
     domain = urlparse(clean_url).netloc.lower()
 
-    # Для OLX теперь отдельный быстрый поток без загрузки полного HTML
     if 'olx.pl' in domain:
         title, price, czynsz, description, photos = parse_olx_api(clean_url)
         final_url = clean_url
