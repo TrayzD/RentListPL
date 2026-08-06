@@ -692,12 +692,30 @@ def card_text(
     )
 
 
-def card_keyboard(item_id: int, url: str, expanded: bool) -> types.InlineKeyboardMarkup:
+def card_caption(
+    title: str, price: Optional[str], czynsz: Optional[str], description: Optional[str], active: bool
+) -> str:
+    """A compact card for a photo caption (Telegram allows at most 1024 chars)."""
+    state = "🟢 <b>Активно</b>" if active else "🔴 <b>Неактивно</b>"
+    desc = shorten(description or "Описание отсутствует.", 260)
+    return (
+        f"{state}\n🏠 <b>{safe(shorten(title, 180))}</b>\n"
+        f"💰 <b>Аренда:</b> {safe(shorten(price or 'Не указано', 70))}\n"
+        f"🏷 <b>Чинш:</b> {safe(shorten(czynsz or 'Не указано', 70))}\n\n"
+        f"📌 {safe(desc)}"
+    )
+
+
+def card_keyboard(item_id: int, url: str, expanded: bool, photo_count: int = 0) -> types.InlineKeyboardMarkup:
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(types.InlineKeyboardButton(
         "📖 Свернуть описание" if expanded else "📖 Показать описание",
         callback_data=f"toggle:{item_id}:{int(expanded)}",
     ))
+    if photo_count > 1:
+        keyboard.add(types.InlineKeyboardButton(
+            f"🖼 Показать остальные фото ({photo_count - 1})", callback_data=f"photos:{item_id}"
+        ))
     keyboard.add(types.InlineKeyboardButton("🔗 Открыть на сайте", url=url))
     keyboard.add(types.InlineKeyboardButton("🗑 Удалить из списка", callback_data=f"delete:{item_id}"))
     return keyboard
@@ -758,6 +776,43 @@ def send_photos(chat_id: int, photos: list[str], listing_url: str) -> list[int]:
         return result
 
 
+def send_listing_card(
+    chat_id: int,
+    item_id: int,
+    title: str,
+    price: Optional[str],
+    czynsz: Optional[str],
+    description: Optional[str],
+    url: str,
+    photos: list[str],
+    active: bool,
+) -> Optional[int]:
+    """Send one primary Telegram card: cover photo + fields + action buttons."""
+    markup = card_keyboard(item_id, url, False, len(photos))
+    if not photos:
+        message = bot.send_message(chat_id, card_text(title, price, czynsz, description, active, False), reply_markup=markup)
+        return message.message_id
+
+    caption = card_caption(title, price, czynsz, description, active)
+    try:
+        message = bot.send_photo(chat_id, photos[0], caption=caption, reply_markup=markup)
+        return message.message_id
+    except Exception:
+        # Some hosts permit download only when the listing page is sent as Referer.
+        image = download_photo(photos[0], url)
+        if image is not None:
+            try:
+                message = bot.send_photo(chat_id, image, caption=caption, reply_markup=markup)
+                return message.message_id
+            except Exception:
+                pass
+            finally:
+                image.close()
+    # Never lose the listing just because its cover photo expired or is protected.
+    message = bot.send_message(chat_id, card_text(title, price, czynsz, description, active, False), reply_markup=markup)
+    return message.message_id
+
+
 # =============================================================================
 # Handlers
 # =============================================================================
@@ -782,13 +837,14 @@ def list_button(message: types.Message) -> None:
         bot.send_message(message.chat.id, "📋 Ваш список пока пуст.")
         return
     for row in rows:
-        photo_ids = send_photos(message.chat.id, saved_photos(row["photos"]), row["url"])
-        replace_photo_ids(row["id"], owner_id, photo_ids)
-        bot.send_message(
+        photos = saved_photos(row["photos"])
+        card_id = send_listing_card(
             message.chat.id,
-            card_text(row["title"], row["price"], row["czynsz"], row["description"], listing_is_active(row["url"]), False),
-            reply_markup=card_keyboard(row["id"], row["url"], False),
+            row["id"],
+            row["title"], row["price"], row["czynsz"], row["description"], row["url"], photos,
+            listing_is_active(row["url"]),
         )
+        replace_photo_ids(row["id"], owner_id, [card_id] if card_id else [])
 
 
 @bot.message_handler(func=lambda message: bool(message.text and message.text.strip().startswith(("http://", "https://"))))
@@ -812,13 +868,13 @@ def add_listing(message: types.Message) -> None:
         pass
 
     owner_id = message.from_user.id
-    photo_ids = send_photos(message.chat.id, listing.photos, listing.url)
-    item_id = save_listing(owner_id, listing, photo_ids)
-    bot.send_message(
+    item_id = save_listing(owner_id, listing, [])
+    card_id = send_listing_card(
         message.chat.id,
-        card_text(listing.title, listing.price, listing.czynsz, listing.description, True, False),
-        reply_markup=card_keyboard(item_id, listing.url, False),
+        item_id,
+        listing.title, listing.price, listing.czynsz, listing.description, listing.url, listing.photos, True,
     )
+    replace_photo_ids(item_id, owner_id, [card_id] if card_id else [])
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("toggle:"))
@@ -835,16 +891,58 @@ def toggle_description(call: types.CallbackQuery) -> None:
         return
     expanded = not was_expanded
     try:
-        bot.edit_message_text(
-            card_text(row["title"], row["price"], row["czynsz"], row["description"], listing_is_active(row["url"]), expanded),
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=card_keyboard(item_id, row["url"], expanded),
-        )
+        is_active = listing_is_active(row["url"])
+        photos = saved_photos(row["photos"])
+        if call.message.content_type == "photo" and expanded:
+            # A photo caption is limited to 1024 characters.  The full text is
+            # therefore shown only after the user explicitly asks for it.
+            bot.send_message(
+                call.message.chat.id,
+                card_text(row["title"], row["price"], row["czynsz"], row["description"], is_active, True),
+                reply_markup=card_keyboard(item_id, row["url"], True, len(photos)),
+            )
+        elif call.message.content_type == "photo":
+            bot.edit_message_caption(
+                card_caption(row["title"], row["price"], row["czynsz"], row["description"], is_active),
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=card_keyboard(item_id, row["url"], False, len(photos)),
+            )
+        else:
+            bot.edit_message_text(
+                card_text(row["title"], row["price"], row["czynsz"], row["description"], is_active, expanded),
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=card_keyboard(item_id, row["url"], expanded, len(photos)),
+            )
     except Exception:
         bot.answer_callback_query(call.id, "Не удалось обновить сообщение.")
         return
     bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("photos:"))
+def show_remaining_photos(call: types.CallbackQuery) -> None:
+    try:
+        item_id = int(call.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        bot.answer_callback_query(call.id, "Некорректная команда.")
+        return
+    row = one_listing(item_id, call.from_user.id)
+    if not row:
+        bot.answer_callback_query(call.id, "Объявление не найдено в вашем списке.")
+        return
+    photos = saved_photos(row["photos"])[1:]
+    if not photos:
+        bot.answer_callback_query(call.id, "Других фото нет.")
+        return
+    sent_ids = send_photos(call.message.chat.id, photos, row["url"])
+    try:
+        old_ids = [int(value) for value in json.loads(row["photo_msg_ids"] or "[]")]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        old_ids = []
+    replace_photo_ids(item_id, call.from_user.id, list(dict.fromkeys([*old_ids, *sent_ids])))
+    bot.answer_callback_query(call.id, "Фотографии отправлены.")
 
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("delete:"))
