@@ -26,28 +26,28 @@ def init_db():
             czynsz TEXT,
             url TEXT,
             description TEXT,
-            photo TEXT
+            photos TEXT
         )
     ''')
-    # Проверка на наличие колонки photo
     cursor.execute("PRAGMA table_info(listings)")
     columns = [col[1] for col in cursor.fetchall()]
-    if 'photo' not in columns:
-        cursor.execute("ALTER TABLE listings ADD COLUMN photo TEXT")
+    if 'photos' not in columns:
+        cursor.execute("ALTER TABLE listings ADD COLUMN photos TEXT")
     
     conn.commit()
     conn.close()
 
 init_db()
 
-def save_listing(user_id, title, price, czynsz, url, description, photo):
+def save_listing(user_id, title, price, czynsz, url, description, photos_list):
     conn = sqlite3.connect('rent_bot.db')
     cursor = conn.cursor()
     cursor.execute('DELETE FROM listings WHERE user_id = ? AND url = ?', (user_id, url))
+    photos_json = json.dumps(photos_list) if photos_list else '[]'
     cursor.execute('''
-        INSERT INTO listings (user_id, title, price, czynsz, url, description, photo)
+        INSERT INTO listings (user_id, title, price, czynsz, url, description, photos)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id, title, price, czynsz, url, description, photo))
+    ''', (user_id, title, price, czynsz, url, description, photos_json))
     item_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -63,7 +63,7 @@ def delete_listing(item_id, user_id):
 def get_user_listings(user_id):
     conn = sqlite3.connect('rent_bot.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT id, title, price, czynsz, url, photo FROM listings WHERE user_id = ? ORDER BY id DESC', (user_id,))
+    cursor.execute('SELECT id, title, price, czynsz, url, description, photos FROM listings WHERE user_id = ? ORDER BY id DESC', (user_id,))
     rows = cursor.fetchall()
     conn.close()
     return rows
@@ -108,13 +108,13 @@ def get_page_html(url):
     }
     
     try:
-        res = scraper.get(clean_url, headers=headers, cookies=COOKIES, timeout=10)
+        res = scraper.get(clean_url, headers=headers, cookies=COOKIES, timeout=12)
         if 'olx.pl' in clean_url and ('Ogłoszenia - Sprzedam' in res.text or 'd/oferta/' not in res.url):
             mobile_headers = {
                 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Safari/604.1',
                 'Accept-Language': 'pl-PL,pl;q=0.9'
             }
-            res_m = scraper.get(clean_url, headers=mobile_headers, cookies=COOKIES, timeout=10)
+            res_m = scraper.get(clean_url, headers=mobile_headers, cookies=COOKIES, timeout=12)
             if res_m.status_code == 200:
                 return res_m.text, clean_url
 
@@ -141,11 +141,23 @@ def find_czynsz_in_text(text):
 def check_is_active(url):
     html, clean_url = get_page_html(url)
     if not html:
-        return False
-    if 'olx.pl' in url and ('Ogłoszenia - Sprzedam' in html or 'd/oferta/' not in clean_url):
-        return False
-    if 'To ogłoszenie nie jest już dostępne' in html or 'Ogłoszenie nieaktualne' in html or '404' in html:
-        return False
+        return True
+    
+    html_lower = html.lower()
+    if 'otodom.pl' in url:
+        if 'to ogłoszenie nie jest już dostępne' in html_lower or 'nie znaleziono' in html_lower:
+            return False
+        return True
+    elif 'olx.pl' in url:
+        if 'ogłoszenie nie jest już dostępne' in html_lower or 'strona nie została znaleziona' in html_lower:
+            return False
+        if '/d/oferta/' not in clean_url and 'd/oferta/' not in url:
+            return False
+        return True
+    elif 'nieruchomosci-online.pl' in url:
+        if 'ogłoszenie wygasło' in html_lower or 'brak ogłoszenia' in html_lower or '404' in html_lower:
+            return False
+        return True
     return True
 
 # ==============================================================================
@@ -185,27 +197,6 @@ def parse_otodom(soup):
 def parse_olx(soup):
     title, price, czynsz, description, photos = None, None, None, None, []
 
-    for s in soup.find_all('script', type='application/ld+json'):
-        if s.string:
-            try:
-                data = json.loads(s.string)
-                items = data if isinstance(data, list) else [data]
-                for item in items:
-                    if isinstance(item, dict) and item.get('@type') in ['Product', 'SinglePosting', 'Offer', 'Accommodation']:
-                        title = title or item.get('name')
-                        if 'offers' in item and isinstance(item['offers'], dict):
-                            p = item['offers'].get('price')
-                            c = item['offers'].get('priceCurrency', 'PLN')
-                            if p:
-                                price = f"{p} {c}"
-                        if 'image' in item:
-                            imgs = item['image'] if isinstance(item['image'], list) else [item['image']]
-                            photos.extend([img for img in imgs if isinstance(img, str)])
-                        if 'description' in item and not description:
-                            description = item['description']
-            except Exception:
-                pass
-
     for script_id in ['__PRERENDERED_STATE__', '__NEXT_DATA__']:
         script = soup.find('script', id=script_id)
         if script and script.string:
@@ -223,6 +214,18 @@ def parse_olx(soup):
                     if isinstance(price_data, dict) and not price:
                         price = price_data.get('displayValue') or (f"{price_data.get('value')} PLN" if price_data.get('value') else None)
                     
+                    # Извлечение чинша из параметров OLX
+                    for param in ad.get('params', []):
+                        if isinstance(param, dict):
+                            p_name = param.get('name', '').lower()
+                            p_key = param.get('key', '').lower()
+                            if 'czynsz' in p_name or 'opłaty' in p_name or 'czynsz' in p_key or 'oplaty' in p_key:
+                                val = param.get('value', {})
+                                if isinstance(val, dict):
+                                    czynsz = val.get('label') or val.get('key')
+                                elif isinstance(val, (str, int, float)):
+                                    czynsz = f"{val} PLN"
+
                     if not description:
                         raw_desc = ad.get('description', '')
                         description = BeautifulSoup(raw_desc, 'html.parser').get_text(separator='\n').strip()
@@ -231,6 +234,27 @@ def parse_olx(soup):
                         u = photo.get('link') if isinstance(photo, dict) else photo
                         if u:
                             photos.append(str(u).replace('{width}', '1000').replace('{height}', '750'))
+            except Exception:
+                pass
+
+    for s in soup.find_all('script', type='application/ld+json'):
+        if s.string:
+            try:
+                data = json.loads(s.string)
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    if isinstance(item, dict) and item.get('@type') in ['Product', 'SinglePosting', 'Offer', 'Accommodation']:
+                        title = title or item.get('name')
+                        if 'offers' in item and isinstance(item['offers'], dict):
+                            p = item['offers'].get('price')
+                            c = item['offers'].get('priceCurrency', 'PLN')
+                            if p and not price:
+                                price = f"{p} {c}"
+                        if 'image' in item:
+                            imgs = item['image'] if isinstance(item['image'], list) else [item['image']]
+                            photos.extend([img for img in imgs if isinstance(img, str)])
+                        if 'description' in item and not description:
+                            description = item['description']
             except Exception:
                 pass
 
@@ -245,7 +269,7 @@ def parse_olx(soup):
             price = p_elem.get_text(strip=True)
 
     if not description:
-        d_elem = soup.find('div', {'data-cy': 'ad_description'})
+        d_elem = soup.find('div', {'data-cy': 'ad_description'}) or soup.find('div', class_=re.compile(r'description', re.I))
         if d_elem:
             description = d_elem.get_text(separator='\n', strip=True)
 
@@ -259,6 +283,11 @@ def parse_olx(soup):
 
 def parse_nieruchomosci_online(soup):
     title, price, czynsz, description, photos = None, None, None, None, []
+
+    # Поиск реального описания
+    desc_elem = soup.find('div', id='description') or soup.find('div', class_=re.compile(r'box-description|description|desc-content|details-desc', re.I))
+    if desc_elem:
+        description = desc_elem.get_text(separator='\n', strip=True)
 
     for s in soup.find_all('script', type='application/ld+json'):
         if s.string:
@@ -294,11 +323,6 @@ def parse_nieruchomosci_online(soup):
         if p_elem:
             price = p_elem.get_text(strip=True)
 
-    if not description:
-        d_elem = soup.find('div', id='description') or soup.find(class_=re.compile(r'description|desc-content', re.I))
-        if d_elem:
-            description = d_elem.get_text(separator='\n', strip=True)
-
     for img in soup.find_all('img'):
         src = img.get('src') or img.get('data-src') or img.get('data-lazy')
         if src and ('photo' in src or 'media' in src or 'images' in src):
@@ -323,13 +347,18 @@ def fetch_listing_data(url):
     elif 'nieruchomosci-online' in domain:
         title, price, czynsz, description, photos = parse_nieruchomosci_online(soup)
 
-    if not title or title == 'Bez названия':
+    if not title or title == 'Без названия':
         og_title = soup.find('meta', property='og:title')
         title = og_title['content'] if og_title and og_title.get('content') else 'Без названия'
 
+    # Проверка описания на системный SEO-текст сайта
+    if description and ("Najlepszy portal" in description or "ogłoszeniami nieruchomości" in description):
+        description = None
+
     if not description:
         og_desc = soup.find('meta', property='og:description')
-        description = og_desc['content'] if og_desc and og_desc.get('content') else 'Без описания'
+        if og_desc and og_desc.get('content') and "Najlepszy portal" not in og_desc['content']:
+            description = og_desc['content']
 
     if not czynsz and description:
         czynsz = find_czynsz_in_text(description)
@@ -380,30 +409,38 @@ def handle_list_button(message):
         bot.send_message(message.chat.id, "📋 <b>Ваш список сохраненных объектов пуст.</b>", parse_mode='HTML', reply_markup=get_main_keyboard())
         return
 
-    status_msg = bot.send_message(message.chat.id, f"🔄 Проверяю статус объектов ({len(listings)} шт.)...")
+    status_msg = bot.send_message(message.chat.id, f"🔄 Обновляю список ({len(listings)} объектов)...")
 
     for item in listings:
-        item_id, title, price, czynsz, url, photo = item
+        item_id, title, price, czynsz, url, description, photos_json = item
         is_active = check_is_active(url)
         status_str = "🟢 <b>Активно</b>" if is_active else "🔴 <b>Завершено / Неактивно</b>"
+
+        photos = []
+        if photos_json:
+            try:
+                photos = json.loads(photos_json)
+            except Exception:
+                pass
 
         card_text = (
             f"Статус: {status_str}\n\n"
             f"🏠 <b>{title}</b>\n"
             f"💰 <b>Цена:</b> {price}\n"
-            f"🏷 <b>Чинш / Opłaty:</b> {czynsz}"
+            f"🏷 <b>Чинш / Opłaty:</b> {czynsz}\n\n"
+            f"📝 <b>Описание:</b>\n{description}"
         )
 
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("🔗 Открыть на сайте", url=url))
         markup.add(types.InlineKeyboardButton("🗑 Удалить из базы", callback_data=f"del_{item_id}"))
 
-        if photo:
+        if photos:
+            media = [types.InputMediaPhoto(p) for p in photos[:10]]
             try:
-                bot.send_photo(message.chat.id, photo, caption=card_text, parse_mode='HTML', reply_markup=markup)
-                continue
+                bot.send_media_group(message.chat.id, media)
             except Exception as e:
-                print(f"Ошибка отправки фото из списка: {e}")
+                print(f"Ошибка отправки альбома в листе: {e}")
 
         bot.send_message(message.chat.id, card_text, parse_mode='HTML', reply_markup=markup)
 
@@ -428,8 +465,6 @@ def handle_link(message):
     except Exception:
         pass
 
-    first_photo = data['photos'][0] if data['photos'] else None
-
     item_id = save_listing(
         user_id=message.chat.id,
         title=data['title'],
@@ -437,23 +472,15 @@ def handle_link(message):
         czynsz=data['czynsz'],
         url=data['url'],
         description=data['description'],
-        photo=first_photo
+        photos_list=data['photos']
     )
 
     if data['photos']:
-        media = []
-        for photo_url in data['photos'][:10]:
-            media.append(types.InputMediaPhoto(photo_url))
-
+        media = [types.InputMediaPhoto(photo_url) for photo_url in data['photos'][:10]]
         try:
             bot.send_media_group(message.chat.id, media)
         except Exception as e:
             print(f"Ошибка отправки альбома фото: {e}")
-            if first_photo:
-                try:
-                    bot.send_photo(message.chat.id, first_photo)
-                except Exception:
-                    pass
 
     text = (
         f"Статус: 🟢 <b>Сохранено в базу</b>\n\n"
