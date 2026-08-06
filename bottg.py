@@ -63,13 +63,14 @@ def delete_listing(item_id, user_id):
 def get_user_listings(user_id):
     conn = sqlite3.connect('rent_bot.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT id, title, price, czynsz, url, description, photos FROM listings WHERE user_id = ? ORDER BY id DESC', (user_id,))
+    # Изменен порядок: ORDER BY id ASC (от старых к новым)
+    cursor.execute('SELECT id, title, price, czynsz, url, description, photos FROM listings WHERE user_id = ? ORDER BY id ASC', (user_id,))
     rows = cursor.fetchall()
     conn.close()
     return rows
 
 # ==============================================================================
-# SCRAPER & COOKIES
+# SCRAPER & UTILS
 # ==============================================================================
 scraper = cloudscraper.create_scraper(
     browser={
@@ -85,14 +86,14 @@ COOKIES = {
     'data_protection_consent': 'true'
 }
 
-def clean_photo_url(url, domain):
+def clean_photo_url(url, base_url):
     if not url or not isinstance(url, str):
         return None
     url = url.strip()
     if url.startswith('//'):
         url = 'https:' + url
     elif url.startswith('/'):
-        parsed = urlparse(domain)
+        parsed = urlparse(base_url)
         url = f"{parsed.scheme}://{parsed.netloc}{url}"
     
     if url.startswith(('http://', 'https://')):
@@ -129,7 +130,7 @@ def find_czynsz_in_text(text):
     if not text:
         return None
     patterns = [
-        r'(?:czynsz|opłaty\s+administracyjne|opłaty\s+dodatkowe|opłaty|media)\s*[:\-]?\s*(\d[\d\s\,\.]*)\s*(zł|PLN)',
+        r'(?:czynsz|opłaty\s+administracyjne|opłaty\s+dodatkowe|opłaty|media|dodatkowo)\s*[:\-]?\s*(\d[\d\s\,\.]*)\s*(zł|PLN)',
         r'(\d[\d\s\,\.]*)\s*(zł|PLN)\s*(?:czynsz|opłat|media)'
     ]
     for pat in patterns:
@@ -145,13 +146,11 @@ def check_is_active(url):
     
     html_lower = html.lower()
     if 'otodom.pl' in url:
-        if 'to ogłoszenie nie jest już dostępne' in html_lower or 'nie znaleziono' in html_lower:
+        if 'to ogłoszenie nie jest już dostępne' in html_lower or 'nie znaleziono ogłoszenia' in html_lower:
             return False
         return True
     elif 'olx.pl' in url:
-        if 'ogłoszenie nie jest już dostępne' in html_lower or 'strona nie została znaleziona' in html_lower:
-            return False
-        if '/d/oferta/' not in clean_url and 'd/oferta/' not in url:
+        if 'ogłoszenie nie jest już dostępne' in html_lower or 'to ogłoszenie nie jest dostępne' in html_lower:
             return False
         return True
     elif 'nieruchomosci-online.pl' in url:
@@ -214,11 +213,10 @@ def parse_olx(soup):
                     if isinstance(price_data, dict) and not price:
                         price = price_data.get('displayValue') or (f"{price_data.get('value')} PLN" if price_data.get('value') else None)
                     
-                    # Извлечение чинша из параметров OLX
                     for param in ad.get('params', []):
                         if isinstance(param, dict):
-                            p_name = param.get('name', '').lower()
-                            p_key = param.get('key', '').lower()
+                            p_name = str(param.get('name', '')).lower()
+                            p_key = str(param.get('key', '')).lower()
                             if 'czynsz' in p_name or 'opłaty' in p_name or 'czynsz' in p_key or 'oplaty' in p_key:
                                 val = param.get('value', {})
                                 if isinstance(val, dict):
@@ -273,21 +271,48 @@ def parse_olx(soup):
         if d_elem:
             description = d_elem.get_text(separator='\n', strip=True)
 
-    if len(photos) <= 1:
-        for img in soup.find_all('img'):
-            src = img.get('src') or img.get('data-src')
-            if src and ('apollo-ireland.akamaized.net' in src or 'olx' in src):
-                photos.append(src)
+    for img in soup.find_all('img'):
+        src = img.get('src') or img.get('data-src')
+        if src and ('apollo-ireland.akamaized.net' in src or 'olx' in src):
+            photos.append(src)
 
     return title, price, czynsz, description, photos
 
 def parse_nieruchomosci_online(soup):
     title, price, czynsz, description, photos = None, None, None, None, []
 
-    # Поиск реального описания
-    desc_elem = soup.find('div', id='description') or soup.find('div', class_=re.compile(r'box-description|description|desc-content|details-desc', re.I))
+    # 1. Заголовок
+    t_elem = soup.find('h1', class_=re.compile(r'title|header', re.I)) or soup.find('h1')
+    if t_elem:
+        title = t_elem.get_text(strip=True)
+        # Очистка названия от префиксов
+        title = re.sub(r'^(Mieszkanie|Apartament|Lokale)\s+na\s+wynajem\s*-\s*', '', title, flags=re.I)
+
+    # 2. Цена
+    p_elem = soup.find('span', class_=re.compile(r'price-main|info-price|price', re.I)) or soup.find(class_=re.compile(r'price', re.I))
+    if p_elem:
+        price = p_elem.get_text(strip=True)
+
+    # 3. Описание
+    desc_elem = soup.find('div', id='description') or soup.find('div', class_=re.compile(r'box-description|description|desc-content|details-desc|text-content', re.I))
     if desc_elem:
         description = desc_elem.get_text(separator='\n', strip=True)
+
+    # 4. Чинш из характеристик страницы
+    for li in soup.find_all(['li', 'tr', 'div']):
+        txt = li.get_text(strip=True).lower()
+        if 'czynsz' in txt or 'opłaty' in txt or 'opłata' in txt:
+            match = re.search(r'(\d[\d\s\,\.]*)\s*(zł|PLN)', li.get_text(strip=True), re.I)
+            if match:
+                czynsz = f"{match.group(1).strip()} {match.group(2)}"
+                break
+
+    # 5. Фотографии
+    gallery = soup.find_all(['a', 'img', 'div'], class_=re.compile(r'gallery|photo|slide|carousel', re.I))
+    for elem in gallery:
+        href = elem.get('href') or elem.get('src') or elem.get('data-src') or elem.get('data-large')
+        if href:
+            photos.append(href)
 
     for s in soup.find_all('script', type='application/ld+json'):
         if s.string:
@@ -300,7 +325,7 @@ def parse_nieruchomosci_online(soup):
                             title = item['name']
                         if 'description' in item and not description:
                             description = item['description']
-                        if 'offers' in item and isinstance(item['offers'], dict):
+                        if 'offers' in item and isinstance(item['offers'], dict) and not price:
                             p = item['offers'].get('price')
                             if p:
                                 price = f"{p} PLN"
@@ -313,20 +338,10 @@ def parse_nieruchomosci_online(soup):
             except Exception:
                 pass
 
-    if not title:
-        t_elem = soup.find('h1')
-        if t_elem:
-            title = t_elem.get_text(strip=True)
-
-    if not price:
-        p_elem = soup.find(class_=re.compile(r'price-main|info-price|price', re.I))
-        if p_elem:
-            price = p_elem.get_text(strip=True)
-
-    for img in soup.find_all('img'):
-        src = img.get('src') or img.get('data-src') or img.get('data-lazy')
-        if src and ('photo' in src or 'media' in src or 'images' in src):
-            photos.append(src)
+    if not description:
+        og_desc = soup.find('meta', property='og:description')
+        if og_desc and og_desc.get('content') and "Najlepszy portal" not in og_desc['content']:
+            description = og_desc['content']
 
     return title, price, czynsz, description, photos
 
@@ -347,36 +362,31 @@ def fetch_listing_data(url):
     elif 'nieruchomosci-online' in domain:
         title, price, czynsz, description, photos = parse_nieruchomosci_online(soup)
 
-    if not title or title == 'Без названия':
+    if not title or title.lower() in ['nieruchomości online', 'nieruchomosci-online', 'bez названия']:
         og_title = soup.find('meta', property='og:title')
-        title = og_title['content'] if og_title and og_title.get('content') else 'Без названия'
+        if og_title and og_title.get('content'):
+            title = og_title['content'].replace(' - Nieruchomosci-online.pl', '').replace(' | OLX.pl', '')
 
-    # Проверка описания на системный SEO-текст сайта
     if description and ("Najlepszy portal" in description or "ogłoszeniami nieruchomości" in description):
         description = None
-
-    if not description:
-        og_desc = soup.find('meta', property='og:description')
-        if og_desc and og_desc.get('content') and "Najlepszy portal" not in og_desc['content']:
-            description = og_desc['content']
 
     if not czynsz and description:
         czynsz = find_czynsz_in_text(description)
 
-    if description and len(description) > 800:
-        description = description[:800] + '...'
+    if description and len(description) > 3000:
+        description = description[:3000] + '...'
 
     valid_photos = []
     for p in photos:
         cleaned = clean_photo_url(p, clean_url)
-        if cleaned and cleaned not in valid_photos and not cleaned.endswith(('.svg', '.gif')):
+        if cleaned and cleaned not in valid_photos and not cleaned.endswith(('.svg', '.gif', '.png')):
             valid_photos.append(cleaned)
 
     return {
-        'title': title or 'Без названия',
+        'title': title or 'Объявление',
         'price': price or 'Не указана',
         'czynsz': czynsz or 'Не указан',
-        'description': description or 'Без описания',
+        'description': description or 'Описание отсутствует.',
         'photos': valid_photos,
         'url': clean_url
     }
@@ -409,7 +419,7 @@ def handle_list_button(message):
         bot.send_message(message.chat.id, "📋 <b>Ваш список сохраненных объектов пуст.</b>", parse_mode='HTML', reply_markup=get_main_keyboard())
         return
 
-    status_msg = bot.send_message(message.chat.id, f"🔄 Обновляю список ({len(listings)} объектов)...")
+    status_msg = bot.send_message(message.chat.id, f"🔄 Формирую список ({len(listings)} объектов)...")
 
     for item in listings:
         item_id, title, price, czynsz, url, description, photos_json = item
@@ -440,7 +450,7 @@ def handle_list_button(message):
             try:
                 bot.send_media_group(message.chat.id, media)
             except Exception as e:
-                print(f"Ошибка отправки альбома в листе: {e}")
+                print(f"Ошибка отправки медиагруппы в листе: {e}")
 
         bot.send_message(message.chat.id, card_text, parse_mode='HTML', reply_markup=markup)
 
@@ -456,7 +466,7 @@ def handle_link(message):
 
     data = fetch_listing_data(url)
 
-    if not data or data['title'] == 'Без названия':
+    if not data or data['title'] == 'Объявление':
         bot.edit_message_text("❌ Не удалось загрузить данные по этой ссылке.", message.chat.id, loading_msg.message_id)
         return
 
